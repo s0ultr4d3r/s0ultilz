@@ -1,0 +1,11 @@
+.env
+
+bin/
+*.exe
+*.out
+
+.vscode/
+.idea/
+
+cookies.txt
+.DS_Store
