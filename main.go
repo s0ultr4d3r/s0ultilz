@@ -2,9 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,15 +19,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
+	xproxy "golang.org/x/net/proxy"
 )
 
 // ---------- Types ----------
 
 type Config struct {
-	TelegramToken string
+	TelegramToken       string
+	TelegramSocks5Proxy string
 
 	YtDlpPath             string
 	YtDlpCookiesFile      string // generic cookies (used for IG etc.)
@@ -46,6 +57,12 @@ type Config struct {
 	GalleryDlCookiesFile string
 
 	FfmpegPath string
+
+	DownloadStorageDir     string
+	DownloadPublicBaseURL  string
+	DownloadListenAddr     string
+	DownloadRetention      time.Duration
+	DownloadMaxStorageSize int64
 }
 
 type PendingAction int
@@ -77,15 +94,29 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
+	tgHTTPClient, err := newTelegramHTTPClient(cfg.TelegramSocks5Proxy)
+	if err != nil {
+		log.Fatalf("failed to create telegram http client: %v", err)
+	}
+
+	bot, err := tgbotapi.NewBotAPIWithClient(cfg.TelegramToken, tgbotapi.APIEndpoint, tgHTTPClient)
 	if err != nil {
 		log.Fatalf("failed to create bot: %v", err)
 	}
 	bot.Debug = false
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
-	log.Printf("Config: yt-dlp=%s, proxy=%s, js-runtimes=%q, remote-components=%q, cache-dir=%q, yt_force_ipv4=%v, yt_extractor_args_base=%q, yt_cookies=%q, yt_clients_audio=%q, yt_clients_video=%q",
-		cfg.YtDlpPath, cfg.YtDlpProxy, cfg.YtDlpJsRuntimes, cfg.YtDlpRemoteComponents, cfg.YtDlpCacheDir, cfg.YtDlpForceIPv4, cfg.YtDlpYouTubeExtractorArgs, cfg.YtDlpYouTubeCookiesFile, cfg.YouTubeClientsAudio, cfg.YouTubeClientsVideo)
+	log.Printf("Config: tg_socks5_proxy=%q, yt-dlp=%s, proxy=%s, js-runtimes=%q, remote-components=%q, cache-dir=%q, yt_force_ipv4=%v, yt_extractor_args_base=%q, yt_cookies=%q, yt_clients_audio=%q, yt_clients_video=%q, download_dir=%q, download_public_base_url=%q, download_listen_addr=%q, download_retention=%s, download_max_storage=%s",
+		cfg.TelegramSocks5Proxy, cfg.YtDlpPath, cfg.YtDlpProxy, cfg.YtDlpJsRuntimes, cfg.YtDlpRemoteComponents, cfg.YtDlpCacheDir, cfg.YtDlpForceIPv4, cfg.YtDlpYouTubeExtractorArgs, cfg.YtDlpYouTubeCookiesFile, cfg.YouTubeClientsAudio, cfg.YouTubeClientsVideo, cfg.DownloadStorageDir, cfg.DownloadPublicBaseURL, cfg.DownloadListenAddr, cfg.DownloadRetention, humanBytes(cfg.DownloadMaxStorageSize))
+
+	if err := os.MkdirAll(cfg.DownloadStorageDir, 0755); err != nil {
+		log.Fatalf("failed to create download storage dir %s: %v", cfg.DownloadStorageDir, err)
+	}
+	cleanupDownloadStorage(cfg.DownloadStorageDir, cfg.DownloadRetention, cfg.DownloadMaxStorageSize)
+	go startDownloadCleanupLoop(cfg.DownloadStorageDir, cfg.DownloadRetention, cfg.DownloadMaxStorageSize)
+	if cfg.DownloadListenAddr != "" {
+		go startDownloadHTTPServer(cfg.DownloadListenAddr, cfg.DownloadStorageDir)
+	}
 
 	app := &App{
 		Bot:     bot,
@@ -127,6 +158,115 @@ func main() {
 			app.handleNonCommandMessage(update.Message)
 		}
 	}
+}
+
+// ---------- Telegram HTTP client ----------
+
+func newTelegramHTTPClient(proxyRaw string) (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.TLSHandshakeTimeout = 30 * time.Second
+	transport.ResponseHeaderTimeout = 60 * time.Second
+	transport.ExpectContinueTimeout = 1 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   90 * time.Second,
+	}
+
+	proxyRaw = strings.TrimSpace(proxyRaw)
+	if proxyRaw == "" {
+		return client, nil
+	}
+
+	proxyAddr, auth, err := parseSOCKS5Proxy(proxyRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	baseDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	socksDialer, err := xproxy.SOCKS5("tcp", proxyAddr, auth, baseDialer)
+	if err != nil {
+		return nil, fmt.Errorf("create socks5 dialer: %w", err)
+	}
+
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		type dialResult struct {
+			conn net.Conn
+			err  error
+		}
+
+		ch := make(chan dialResult, 1)
+
+		go func() {
+			conn, err := socksDialer.Dial(network, addr)
+			ch <- dialResult{conn: conn, err: err}
+		}()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-ch:
+			return res.conn, res.err
+		}
+	}
+
+	return client, nil
+}
+
+func parseSOCKS5Proxy(raw string) (string, *xproxy.Auth, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil, fmt.Errorf("empty telegram socks5 proxy")
+	}
+
+	if !strings.Contains(raw, "://") {
+		return raw, nil, nil
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse telegram socks5 proxy: %w", err)
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "socks5" && scheme != "socks5h" {
+		return "", nil, fmt.Errorf("unsupported telegram proxy scheme: %s", u.Scheme)
+	}
+
+	if u.Host == "" {
+		return "", nil, fmt.Errorf("empty telegram socks5 proxy host")
+	}
+
+	var auth *xproxy.Auth
+	if u.User != nil {
+		user := u.User.Username()
+		pass, _ := u.User.Password()
+		if user != "" {
+			auth = &xproxy.Auth{
+				User:     user,
+				Password: pass,
+			}
+		}
+	}
+
+	return u.Host, auth, nil
+}
+
+func isSOCKSProxyValue(v string) bool {
+	v = strings.TrimSpace(strings.ToLower(v))
+	if v == "" {
+		return false
+	}
+	if !strings.Contains(v, "://") {
+		return true
+	}
+	return strings.HasPrefix(v, "socks5://") || strings.HasPrefix(v, "socks5h://")
 }
 
 // ---------- Config ----------
@@ -171,6 +311,13 @@ func LoadConfig() (*Config, error) {
 
 	clientsAudio := strings.TrimSpace(os.Getenv("YTDLP_YOUTUBE_CLIENTS_AUDIO"))
 	clientsVideo := strings.TrimSpace(os.Getenv("YTDLP_YOUTUBE_CLIENTS_VIDEO"))
+	ytProxy := strings.TrimSpace(os.Getenv("YTDLP_PROXY"))
+
+	tgProxy := strings.TrimSpace(os.Getenv("TELEGRAM_SOCKS5_PROXY"))
+	if tgProxy == "" && isSOCKSProxyValue(ytProxy) {
+		tgProxy = ytProxy
+	}
+
 	// If YouTube cookies are provided, prefer web-like clients for video, because android client does not support cookies in yt-dlp.
 	ytCookies := strings.TrimSpace(os.Getenv("YTDLP_YOUTUBE_COOKIES_FILE"))
 	if clientsAudio == "" {
@@ -187,12 +334,28 @@ func LoadConfig() (*Config, error) {
 		clientsVideo = removeFromCSV(clientsVideo, "android")
 	}
 
+	downloadStorageDir := strings.TrimSpace(os.Getenv("DOWNLOAD_STORAGE_DIR"))
+	if downloadStorageDir == "" {
+		downloadStorageDir = "/var/lib/s0ultilz-bot/downloads"
+	}
+	downloadPublicBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("DOWNLOAD_PUBLIC_BASE_URL")), "/")
+	downloadListenAddr := strings.TrimSpace(os.Getenv("DOWNLOAD_LISTEN_ADDR"))
+	downloadRetentionDays := parseIntEnv("DOWNLOAD_RETENTION_DAYS", 31)
+	if downloadRetentionDays < 1 {
+		downloadRetentionDays = 31
+	}
+	downloadMaxStorageGB := parseIntEnv("DOWNLOAD_MAX_STORAGE_GB", 20)
+	if downloadMaxStorageGB < 1 {
+		downloadMaxStorageGB = 20
+	}
+
 	cfg := &Config{
-		TelegramToken: token,
+		TelegramToken:       token,
+		TelegramSocks5Proxy: tgProxy,
 
 		YtDlpPath:             ytPath,
 		YtDlpCookiesFile:      strings.TrimSpace(os.Getenv("YTDLP_COOKIES_FILE")),
-		YtDlpProxy:            strings.TrimSpace(os.Getenv("YTDLP_PROXY")),
+		YtDlpProxy:            ytProxy,
 		YtDlpJsRuntimes:       jsRuntimes,
 		YtDlpRemoteComponents: remoteComponents,
 		YtDlpCacheDir:         cacheDir,
@@ -209,6 +372,12 @@ func LoadConfig() (*Config, error) {
 		GalleryDlCookiesFile: strings.TrimSpace(os.Getenv("GALLERYDL_COOKIES_FILE")),
 
 		FfmpegPath: strings.TrimSpace(os.Getenv("FFMPEG_PATH")),
+
+		DownloadStorageDir:     downloadStorageDir,
+		DownloadPublicBaseURL:  downloadPublicBaseURL,
+		DownloadListenAddr:     downloadListenAddr,
+		DownloadRetention:      time.Duration(downloadRetentionDays) * 24 * time.Hour,
+		DownloadMaxStorageSize: int64(downloadMaxStorageGB) * 1024 * 1024 * 1024,
 	}
 	return cfg, nil
 }
@@ -229,6 +398,18 @@ func parseBoolEnv(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func parseIntEnv(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // ---------- Pending state helpers ----------
@@ -467,28 +648,6 @@ func (a *App) processYtURL(chatID int64, url string, audioOnly bool) {
 		return
 	}
 
-	if !audioOnly {
-		// enforce Telegram limit
-		var filtered []string
-		for _, fp := range files {
-			info, err := os.Stat(fp)
-			if err != nil {
-				continue
-			}
-			if info.Size() <= telegramUploadLimit {
-				filtered = append(filtered, fp)
-			}
-		}
-		if len(filtered) == 0 {
-			resp := tgbotapi.NewMessage(chatID, "Видео слишком большое для Telegram (~50MB). Попробуй /ytmp3.")
-			resp.ReplyMarkup = defaultKeyboard()
-			_, _ = a.Bot.Send(resp)
-			_ = os.RemoveAll(filepath.Dir(files[0]))
-			return
-		}
-		files = filtered
-	}
-
 	for _, fp := range files {
 		a.sendAsDocument(chatID, fp)
 	}
@@ -641,7 +800,6 @@ func (a *App) downloadYouTubeAuto(url string, audioOnly bool) ([]string, string,
 		clients = parseCSV(a.Cfg.YouTubeClientsAudio)
 	} else {
 		clients = parseCSV(a.Cfg.YouTubeClientsVideo)
-		// For video, avoid android client when cookies are configured (yt-dlp will skip it anyway).
 		if cookies != "" {
 			var filtered []string
 			for _, c := range clients {
@@ -684,7 +842,6 @@ func (a *App) downloadYouTubeAuto(url string, audioOnly bool) ([]string, string,
 
 		lastErr = err
 
-		// If YouTube demands "Sign in to confirm you're not a bot" => cookies are needed; do not spam retries.
 		if isYouTubeSignInBotCheck(logs) {
 			_ = os.RemoveAll(tmpDir)
 			return nil, allLogs.String(), fmt.Errorf("youtube bot-check: cookies required")
@@ -705,7 +862,7 @@ func (a *App) downloadYouTubeAuto(url string, audioOnly bool) ([]string, string,
 }
 
 func (a *App) downloadYouTubeOnce(url string, audioOnly bool, client string, tmpDir string) ([]string, string, error) {
-	args := []string{"--no-playlist", "--restrict-filenames", "-o", filepath.Join(tmpDir, "%(title)s.%(ext)s")}
+	args := []string{"--no-playlist", "-o", filepath.Join(tmpDir, "%(title).180B.%(ext)s")}
 
 	if a.Cfg.YtDlpCacheDir != "" {
 		args = append(args, "--cache-dir", a.Cfg.YtDlpCacheDir)
@@ -721,13 +878,10 @@ func (a *App) downloadYouTubeOnce(url string, audioOnly bool, client string, tmp
 		args = append(args, "--force-ipv4")
 	}
 
-	// Prefer YouTube cookies file if set (important!)
 	cookies := strings.TrimSpace(a.Cfg.YtDlpYouTubeCookiesFile)
 	if cookies == "" {
 		cookies = strings.TrimSpace(a.Cfg.YtDlpCookiesFile)
 	}
-	// Note: yt-dlp currently doesn't support cookies for the android client; it will be skipped.
-	// For audio downloads we still want to allow android client attempts, so we simply don't pass cookies there.
 	if cookies != "" && !strings.EqualFold(client, "android") {
 		args = append(args, "--cookies", cookies)
 	}
@@ -743,7 +897,6 @@ func (a *App) downloadYouTubeOnce(url string, audioOnly bool, client string, tmp
 	if audioOnly {
 		args = append(args, "-x", "--audio-format", "mp3", "--audio-quality", "0")
 	} else {
-		// keep small for Telegram
 		args = append(args, "-f", "bv*[height<=480]+ba/best[height<=480]/b[height<=480]/best", "--merge-output-format", "mp4")
 	}
 
@@ -878,11 +1031,37 @@ func (a *App) sendAsDocument(chatID int64, path string) {
 		}
 	}
 
+	info, statErr := os.Stat(outPath)
+	if statErr == nil && info.Size() > telegramUploadLimit {
+		a.sendPublicDownloadLink(chatID, outPath, info.Size())
+		return
+	}
+
 	cfg := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(outPath))
 	cfg.ReplyMarkup = defaultKeyboard()
 	if _, err := a.Bot.Send(cfg); err != nil {
 		log.Printf("failed to send document %s: %v", outPath, err)
+		if statErr == nil {
+			a.sendPublicDownloadLink(chatID, outPath, info.Size())
+		}
 	}
+}
+
+func (a *App) sendPublicDownloadLink(chatID int64, path string, size int64) {
+	link, err := storePublicDownload(a.Cfg.DownloadStorageDir, a.Cfg.DownloadPublicBaseURL, path)
+	if err != nil {
+		log.Printf("failed to store public download %s: %v", path, err)
+		resp := tgbotapi.NewMessage(chatID, "Файл больше лимита Telegram, и не удалось положить его на сервер 😿")
+		resp.ReplyMarkup = defaultKeyboard()
+		_, _ = a.Bot.Send(resp)
+		return
+	}
+
+	cleanupDownloadStorage(a.Cfg.DownloadStorageDir, a.Cfg.DownloadRetention, a.Cfg.DownloadMaxStorageSize)
+
+	resp := tgbotapi.NewMessage(chatID, fmt.Sprintf("Файл больше лимита Telegram (%s). Ссылка на скачивание:\n%s", humanBytes(size), link))
+	resp.ReplyMarkup = defaultKeyboard()
+	_, _ = a.Bot.Send(resp)
 }
 
 func normalizeVideoForTelegram(ffmpegPath, inPath string) (string, error) {
@@ -914,6 +1093,240 @@ func normalizeVideoForTelegram(ffmpegPath, inPath string) (string, error) {
 		return "", fmt.Errorf("ffmpeg failed: %w", err)
 	}
 	return outPath, nil
+}
+
+// ---------- Public download storage ----------
+
+func startDownloadCleanupLoop(storageDir string, retention time.Duration, maxStorageSize int64) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cleanupDownloadStorage(storageDir, retention, maxStorageSize)
+	}
+}
+
+func startDownloadHTTPServer(addr string, storageDir string) {
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir(storageDir)))
+
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	log.Printf("download HTTP server listening on %s, dir=%s", addr, storageDir)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("download HTTP server error: %v", err)
+	}
+}
+
+type downloadFileInfo struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+func cleanupDownloadStorage(storageDir string, retention time.Duration, maxStorageSize int64) {
+	if strings.TrimSpace(storageDir) == "" {
+		return
+	}
+
+	now := time.Now()
+	var files []downloadFileInfo
+	var total int64
+
+	_ = filepath.WalkDir(storageDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if retention > 0 && now.Sub(info.ModTime()) > retention {
+			if err := os.Remove(path); err != nil {
+				log.Printf("failed to remove expired download %s: %v", path, err)
+			} else {
+				log.Printf("removed expired download %s", path)
+			}
+			return nil
+		}
+		files = append(files, downloadFileInfo{path: path, size: info.Size(), modTime: info.ModTime()})
+		total += info.Size()
+		return nil
+	})
+
+	if maxStorageSize > 0 && total > maxStorageSize {
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].modTime.Before(files[j].modTime)
+		})
+		for _, f := range files {
+			if total <= maxStorageSize {
+				break
+			}
+			if err := os.Remove(f.path); err != nil {
+				log.Printf("failed to remove old download %s: %v", f.path, err)
+				continue
+			}
+			total -= f.size
+			log.Printf("removed old download %s to keep storage under %s", f.path, humanBytes(maxStorageSize))
+		}
+	}
+
+	removeEmptyDirs(storageDir)
+}
+
+func removeEmptyDirs(root string) {
+	var dirs []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() && path != root {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, dir := range dirs {
+		_ = os.Remove(dir)
+	}
+}
+
+func storePublicDownload(storageDir string, publicBaseURL string, srcPath string) (string, error) {
+	if strings.TrimSpace(publicBaseURL) == "" {
+		return "", fmt.Errorf("DOWNLOAD_PUBLIC_BASE_URL is not set")
+	}
+
+	token, err := randomHex(16)
+	if err != nil {
+		return "", err
+	}
+
+	fileName := safeDownloadFileName(srcPath)
+	dstDir := filepath.Join(storageDir, token)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return "", err
+	}
+
+	dstPath := filepath.Join(dstDir, fileName)
+	if err := copyFile(srcPath, dstPath); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dstPath, 0644); err != nil {
+		return "", err
+	}
+
+	return strings.TrimRight(publicBaseURL, "/") + "/" + url.PathEscape(token) + "/" + url.PathEscape(fileName), nil
+}
+
+func safeDownloadFileName(path string) string {
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	name = strings.TrimSuffix(name, "_tg")
+	name = strings.TrimSuffix(name, "-tg")
+	name = strings.TrimSuffix(name, ".tg")
+	name = normalizeFileNamePart(name)
+	if name == "" {
+		name = "download"
+	}
+	ext = normalizeFileExt(ext)
+	return name + ext
+}
+
+func normalizeFileNamePart(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	prevUnderscore := false
+	runeCount := 0
+	for _, r := range s {
+		var out rune
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			out = r
+		case r == ' ' || r == '_' || r == '-' || r == '.' || r == ',' || r == ':' || r == ';' || r == '(' || r == ')' || r == '[' || r == ']':
+			out = '_'
+		default:
+			out = '_'
+		}
+		if out == '_' {
+			if prevUnderscore {
+				continue
+			}
+			prevUnderscore = true
+		} else {
+			prevUnderscore = false
+		}
+		b.WriteRune(out)
+		runeCount++
+		if runeCount >= 160 {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "_.-")
+}
+
+func normalizeFileExt(ext string) string {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	if ext == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('.')
+	for _, r := range strings.TrimPrefix(ext, ".") {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 1 {
+		return ""
+	}
+	return b.String()
+}
+
+func copyFile(src string, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	_, copyErr := io.Copy(out, in)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+func randomHex(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // ---------- Utils ----------
